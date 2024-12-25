@@ -7,6 +7,7 @@
 
 <h2>Languages Used</h2>
 - <b>R</b>
+- <b>SQLite</b>
 
 <h2>Program walk-through:</h2>
 
