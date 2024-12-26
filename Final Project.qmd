@@ -1,0 +1,212 @@
+---
+title: "Final Project"
+format: pdf
+editor: visual
+---
+
+## Final Project: Lending Club
+
+## Loading the Data
+
+```{r}
+library(ggplot2)
+library(usmap)
+library(gridExtra)
+library(dplyr)
+library(data.table)
+library(rpart)
+library(rpart.plot)
+library(caTools)
+library(randomForest)
+library(ROCR)
+library(RSQLite)
+library(car)
+
+dcon <- dbConnect(SQLite(), dbname = 
+        "/Users/pirroprifti/Desktop/R for Data Science/Final Project/accepted_db.db")
+
+res <- dbSendQuery(conn = dcon, "
+SELECT *
+FROM acc_clean;")
+mydf <- dbFetch(res, -1)
+dbClearResult(res)
+```
+
+Plot 1
+
+```{r}
+grade_prop = table(mydf$grade) / sum(table(mydf$grade))
+colors = ifelse(names(grade_prop) == "A" | 
+                names(grade_prop) == "B", "darkgreen", "red")
+barplot(grade_prop, 
+        ylab = "% of Total", 
+        xlab = "Loan Grades", 
+        main = "Proportion of Loan Grades", 
+        col = colors, 
+        ylim = c(0,.4), 
+        axes = FALSE)
+
+perc = paste0(seq(0, 40, 5),"%")
+axis(2, at = seq(0, .4, .05), labels = perc, cex.axis = .4)
+```
+
+```{r}
+# Query data for only fully paid loans
+res <- dbSendQuery(conn = dcon, "
+SELECT addr_state, loan_status
+FROM acc_clean
+WHERE loan_status == 'Fully Paid';")
+subset <- dbFetch(res, -1)
+dbClearResult(res)
+
+# Rename column and create data frame for ggplot
+colnames(subset)[colnames(subset) == "addr_state"] = "state"
+states = levels(factor(subset$state))
+df = data.frame(state = states, 
+                Count = c(rep(1, 51)), 
+                Proportion = c(rep(1, 51)))
+
+total = 0
+for (i in 1:length(states)){
+  df[i, 2] = length(subset$loan_status[subset$state == states[i]])
+  total = sum(mydf$addr_state == states[i])
+  df[i, 3] = df[i, 2] / total
+}
+
+count = plot_usmap(regions = "state", data = df, values = "Count", labels = T) + 
+           labs(title = "US Heat Map of Non-Deliquent Loans") +
+           theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+                 legend.position = "bottom") +
+           scale_fill_gradient(low = "yellow", high = "red")
+
+prop = plot_usmap(regions = "state", data = df, values = "Proportion", labels = T) +
+           labs(title = "US Heat Map of Non-Deliquent Loans") +
+           theme(plot.title = element_text(hjust = 0.5, face = "bold"), 
+                 legend.position = "bottom") +
+           scale_fill_gradient(low = "yellow", high = "red")
+
+grid.arrange(count, prop, ncol = 2)
+```
+
+```{r}
+# Creating appropriate data
+
+# Creating factor variables
+mydf <- mydf %>%
+  mutate_if(is.character, as.factor)
+
+# Train test split at 70%
+set.seed(123, sample.kind = "Rejection")
+spl = sample.split(mydf$default, .7)
+train_set = mydf[spl, ]
+test_set = mydf[!spl, ]
+
+# Perform stratified sampling to get a small enough sample
+stratified_sample = train_set %>%
+  group_by(default) %>%                   
+  sample_n(size = floor(.05 * n()), replace = FALSE)
+
+# Omitting NAs so Model Runs
+clean = na.omit(stratified_sample)
+```
+
+```{r}
+# Finding key features
+
+# Removing Irrelevant and Redundant Columns
+# ("last_fico_range_low", "grade", "sub_grade", "addr_state", "loan_status")
+
+# Running Random Forest Model
+rf_mod = randomForest(default ~ . -grade -sub_grade -addr_state -loan_status 
+                      -last_fico_range_low, data = clean, ntree = 500, 
+                      nodesize = 1, mtry = 10)
+
+# Checking For Important Variables with Random Forests and Getting Top 10
+importance_data = importance(rf_mod)
+var_imp_df = data.frame(Variables = rownames(importance_data), 
+                        Importance = importance_data[, 1])
+top_vars <- var_imp_df[order(-var_imp_df$Importance), ][1:10, ]
+
+# Uploading variable importance data frame to database for quick plot
+dbWriteTable(conn = dcon, name = "var_imp", top_vars,
+             append = TRUE, row.names = FALSE)
+
+# Plotting
+ggplot(top_vars, aes(x = reorder(Variables, Importance), y = Importance, 
+  fill = Importance)) + geom_bar(stat = "identity", width = .6) + 
+  coord_flip() + theme_minimal() + 
+  labs(title = "Top 10 Variable Importance", x = "Variables", y = "Importance") +
+  scale_fill_gradient(low = "blue", high = "red")
+  
+```
+
+```{r}
+# Building logistic regression
+
+# Creating train and test sets of variables we want to use, omitting NAs
+set.seed(123, sample.kind = "Rejection")
+train_set_clean = na.omit(train_set[, c("default", "last_fico_range_high", 
+                                        "int_rate", "emp_length", "dti", 
+                                        "installment", "mo_sin_old_rev_tl_op")])
+test_set_clean = na.omit(test_set[, c("default", "last_fico_range_high", 
+                                        "int_rate", "emp_length", "dti", 
+                                        "installment", "mo_sin_old_rev_tl_op")])
+
+# Creating model with all chosen variables and 
+# checking for multicollinearity and significant variables
+model = glm(data = train_set_clean, default ~ ., family = "binomial")
+summary(model)
+vif(model)
+cor(train_set_clean[, c(2, 3, 5, 6, 7)])
+```
+
+```{r}
+#Model Evaluation
+
+# Prediction
+test_set_clean$p_hat = predict(newdata = test_set_clean, model, type = "response")
+test_set_clean$y_hat = ifelse(test_set_clean$p_hat > .5, 1, 0)
+
+#Confusion matrix and metrics
+matrix = table(Actual = test_set_clean$default, Predicted = test_set_clean$y_hat)
+Accuracy = (matrix[1, 1] + matrix[2, 2]) / sum(matrix)
+Specificity = matrix[1, 1] / sum(matrix[1, ])
+Sensitivity = matrix[2, 2] / sum(matrix[2, ])
+
+#ROC
+roc.pred = prediction(test_set_clean$p_hat, test_set_clean$default)
+perf = performance(roc.pred, "tpr", "fpr")
+plot(perf, main = "ROC Curve", xlab = "1-Specificity", ylab = "Sensitivity",
+     colorize = T)
+abline(0,1)
+
+#AUC
+auc = performance(roc.pred, "auc")
+as.numeric(auc@y.values)
+```
+
+```{r}
+#Model Optimization
+
+#Loss Matrix
+LossMatrix = matrix(c(0,1.5,1,0), nrow = 2, ncol = 2, byrow = F )
+p_bar = LossMatrix[1, 2] / (LossMatrix[1, 2] + LossMatrix[2, 1])
+
+#Incorporating new threshold
+test_set_clean$new_y_hat = ifelse(test_set_clean$p_hat > p_bar, 1, 0)
+
+#Confusion matrix and metrics
+new_matrix = table(Actual = test_set_clean$default, 
+                   Predicted = test_set_clean$new_y_hat)
+new_Accuracy = (new_matrix[1, 1] + new_matrix[2, 2]) / sum(new_matrix)
+new_Specificity = new_matrix[1, 1] / sum(new_matrix[1, ])
+new_Sensitivity = new_matrix[2, 2] / sum(new_matrix[2, ])
+```
+
+Given how large the data is, a lot of cleaning was necessary to reduce the dimensionality so that way we can get a clearer picture of what variables are important and to allow for computational feasibility when applying any modeling techniques. First I began by removing columns that were mostly filled with NA and empty string values as these variables would provide us with poor insights. Similarly, I removed any columns which were single valued as this does not give us any new information. After these more automated techniques, I began to parse through the sub-100 variables to see if any of the column names weren't pertinent to helping us better understand default and removed them accordingly. For example, the columns url and title. Lastly, I removed variables that would lead to data leakage like "recoveries" which only occurs after someone has already defaulted.
+
+Next, I had to better categorize the dependent variable. I engineered a binary variable, default, which combined the loan statuses that are conventionally considered delinquent. This left one category of loans that did not fit this binary mold, current. Current means that the loans are still in term and are not delinquent. They cannot give us any insight on the characteristics of a good or bad loan since they have not come to term, so I omitted them from the analysis. I also created a dummy variable using the loan grade column which puts loans into either prime or sub-prime buckets which is characterized by having a loan grade less than a rating of B.
+
+Now with the data being prepared, I proceeded to split the data into training and test sets. This split was still too large for the random forest model to run, so I decided to take a stratified random sample from the training set to still give the model an accurate representation of the data, but small enough so that it will run. After omitting NAs, as the model cannot handle these values, I was left with a small enough sample to preform the analysis.
+
+I ran the random forests model on all variables except those that I deemed to be redundant (like loan grade and sub grade) and used default parameters for classification problems (ntree of 500, a node size of 1, and mtry of 10). From this model I was able to extract each variable's importance. I used this data to create a data frame and then selected the top ten variables according to the mean decrease in the gini coefficient as calculated by the model. It seems that fico score (high value of the last fico range) is overwhelmingly the most important variable for predicting default with features like interest rate, employment length, and debt-income ratio falling greatly behind. 

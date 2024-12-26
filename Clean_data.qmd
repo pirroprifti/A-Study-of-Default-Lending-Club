@@ -1,0 +1,92 @@
+---
+title: "Clean_data"
+format: pdf
+editor: visual
+---
+
+```{r}
+library(ggplot2)
+library(usmap)
+library(gridExtra)
+library(dplyr)
+library(data.table)
+library(rpart)
+library(rpart.plot)
+library(caTools)
+library(randomForest)
+library(ROCR)
+library(RSQLite)
+
+dcon <- dbConnect(SQLite(), dbname = 
+  "/Users/pirroprifti/Desktop/R for Data Science/Final Project/accepted_db.db")
+
+# Query data for loans that have come to term
+res <- dbSendQuery(conn = dcon, "
+SELECT *
+FROM accepted
+WHERE loan_status NOT IN ('Current', 'In Grace Period') ;")
+clean <- dbFetch(res, -1)
+dbClearResult(res)
+```
+
+```{r}
+# Data Cleaning
+
+# Drop Unnecessary Columns According to NAs and ""
+index = c()
+for (i in 1:ncol(clean)){
+  perc_na = mean(is.na(clean[,i]))
+  if (perc_na > .5){index = append(index, i)}
+}
+clean = clean[, -index]
+
+# Dropping unimportant columns
+# head(acc[, 1:35], 1)
+drop = c("id", "issue_d", "url", "earliest_cr_line", "title", "emp_title", 
+         "zip_code")
+clean = clean[, !names(clean) %in% drop]
+
+# head(acc[, 36:70], 1)
+drop = c("last_pymnt_d", "last_credit_pull_d" )
+clean = clean[, !names(clean) %in% drop]
+
+# head(acc[71:103, ], 1)
+drop = c("disbursement_method", "initial_list_status")
+clean = clean[, !names(clean) %in% drop]
+
+# Removing data leakage features
+drop = c("recoveries", "collection_recovery_fee", "total_rec_prncp", 
+         "last_pymnt_amnt", "total_pymnt_inv", "total_pymnt", 
+         "funded_amnt_inv", "debt_settlement_flag", "out_prncp_inv", "out_prncp", 
+         "total_rec_int", "total_rec_late_fee")
+clean = clean[, !names(clean) %in% drop]
+
+# Dropping Single Value Columns
+index = c()
+for (i in 1:ncol(clean)){
+  colm = clean[!is.na(clean[,i]), i]
+  if (length(unique(colm)) < 2){index = append(index, i)}
+}
+clean = clean[, -index]
+```
+
+```{r}
+# Designing Dummy and Factor Variables
+
+# Dependent Variable
+indicator = ifelse(clean$loan_status == "Fully Paid" | 
+       clean$loan_status == 
+       "Does not meet the credit policy. Status:Fully Paid", 0, 1)
+clean$default = as.factor(indicator)
+
+# Creating Prime/Sub prime Variable
+indicator = ifelse(clean$grade == "A" | 
+       clean$grade == "B", 0, 1)
+clean$subprime = as.factor(indicator)
+
+# Converting to numeric
+clean$mths_since_recent_inq = as.numeric(clean$mths_since_recent_inq)
+
+dbWriteTable(conn = dcon, name = "acc_clean", clean,
+             append = TRUE, row.names = FALSE)
+```
